@@ -1,29 +1,3 @@
-import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
-
-try:
-    st.write("Secrets keys:", list(st.secrets.keys()))
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(st.secrets["GSHEETS_SPREADSHEET_ID"])
-    st.success("✅ Conectado al Spreadsheet")
-    ws = sh.worksheets()
-    st.write("Hojas detectadas:", [w.title for w in ws])
-    st.write("Primer hoja filas:", len(ws[0].get_all_values()))
-except Exception as e:
-    st.error("❌ Error leyendo Google Sheets")
-    st.exception(e)
-
-st.stop()
-
-
 import re
 import uuid
 from datetime import datetime, date
