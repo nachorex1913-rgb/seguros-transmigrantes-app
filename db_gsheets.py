@@ -206,8 +206,15 @@ if got != expected:
         for row in out.itertuples(index=False):
             values.append([_to_cell(v) for v in row])
 
-        ws.clear()
-        ws.update(values)
+existing = ws.get_all_values()
+
+# Si me intentan guardar vacío pero ya hay data, NO borro
+if out.empty and len(existing) > 1:
+    return
+
+ws.clear()
+ws.update(values)
+
 
     def next_id(self, name: str) -> int:
         df = self.read_table(name)
