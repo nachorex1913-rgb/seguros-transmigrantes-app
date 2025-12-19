@@ -152,18 +152,19 @@ class SheetDB:
             ws.append_row(TABLE_COLUMNS[name])
             return pd.DataFrame(columns=TABLE_COLUMNS[name])
 
-        header = values[0]
-expected = TABLE_COLUMNS[name]
-got = [h.strip() for h in header]
+header = values[0]
+
 expected = TABLE_COLUMNS[name]
 got = [h.strip() for h in header]
 
 if got != expected:
+    # Si solo hay header, se puede reconstruir
     if len(values) <= 1:
         ws.clear()
         ws.append_row(expected)
         return pd.DataFrame(columns=expected)
 
+    # Si ya hay data, no borramos: mapeamos columnas
     rows = values[1:]
     df = pd.DataFrame(rows, columns=got)
 
@@ -172,6 +173,10 @@ if got != expected:
             df[col] = ""
 
     return df[expected]
+
+rows = values[1:]
+df = pd.DataFrame(rows, columns=expected)
+
     
         rows = values[1:]
         df = pd.DataFrame(rows, columns=TABLE_COLUMNS[name])
