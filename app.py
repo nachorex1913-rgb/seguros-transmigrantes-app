@@ -100,6 +100,16 @@ def compute_financials(agent_profit: float, commission_pct: float):
     return commission_amount, your_net
 
 
+# ✅ FIX: status flexible (ACT / ACTIVE / ACTIVO / espacios)
+def normalize_status_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.upper()
+
+
+def is_active_status(s: pd.Series) -> pd.Series:
+    # Considera "ACT", "ACTIVE", "ACTIVO", "ACTIVA", etc.
+    return normalize_status_series(s).str.startswith("ACT")
+
+
 # =============================
 # DATE UTILS (Dom–Sáb)
 # =============================
@@ -195,16 +205,24 @@ def fetch_df(query: str, params: dict | None = None) -> pd.DataFrame:
         cols = ["status", "price", "cost", "agent_profit", "agent_commission_amount", "coverage_key", "days"]
         return df[cols].reset_index(drop=True)
 
-    if q.startswith(
-        "SELECT COALESCE(a.name,'(sin gestor)') AS gestor, SUM(p.price) AS vendido FROM policies p"
-    ):
+    if q.startswith("SELECT COALESCE(a.name,'(sin gestor)') AS gestor, SUM(p.price) AS vendido FROM policies p"):
         # Sales by agent for month
         pol = _load_table("policies")
         ag = _load_table("agents")
         a = str(params["a"])
         b = str(params["b"])
-        pol = pol[(pol["status"].astype(str) == "ACTIVE") & (pol["sale_date"].astype(str) >= a) & (pol["sale_date"].astype(str) <= b)]
-        merged = pol.merge(ag[["id", "name"]], left_on="agent_id", right_on="id", how="left", suffixes=("", "_agent"))
+
+        pol = pol[(pol["sale_date"].astype(str) >= a) & (pol["sale_date"].astype(str) <= b)]
+        # ✅ FIX: status activo flexible
+        pol = pol[is_active_status(pol["status"])]
+
+        merged = pol.merge(
+            ag[["id", "name"]],
+            left_on="agent_id",
+            right_on="id",
+            how="left",
+            suffixes=("", "_agent"),
+        )
         merged["gestor"] = merged["name"].fillna("(sin gestor)")
         out = merged.groupby("gestor", dropna=False)["price"].sum().reset_index().rename(columns={"price": "vendido"})
         out = out.sort_values(by=["vendido"], ascending=False).reset_index(drop=True)
@@ -221,12 +239,15 @@ def fetch_df(query: str, params: dict | None = None) -> pd.DataFrame:
         df = _load_table(table)
         if where:
             if where.strip() == "status='PENDING'":
-                df = df[df["status"].astype(str) == "PENDING"]
+                df = df[normalize_status_series(df["status"]) == "PENDING"]
         return pd.DataFrame([[len(df)]])
 
     if q.startswith("SELECT id, policy_code, sale_date, client_name, raw_coverage_text, price, agent_id FROM policies"):
         pol = _load_table("policies")
-        pol = pol[(pol["status"].astype(str) == "PENDING") & (pol["provider_id"].astype("Int64") == int(params["pid"]))]
+        pol = pol[
+            (normalize_status_series(pol["status"]) == "PENDING")
+            & (pol["provider_id"].astype("Int64") == int(params["pid"]))
+        ]
         pol = pol.sort_values(by=["sale_date"], ascending=False)
         cols = ["id", "policy_code", "sale_date", "client_name", "raw_coverage_text", "price", "agent_id"]
         return pol[cols].reset_index(drop=True)
@@ -373,7 +394,6 @@ def run_sql(query: str, params: dict | None = None) -> None:
     if q.startswith("INSERT INTO policies"):
         df = _load_table("policies")
         new_id = get_db().next_id("policies")
-        # minimal created_at
         created_at = datetime.now().isoformat(timespec="seconds")
         row = {
             "id": new_id,
@@ -392,7 +412,7 @@ def run_sql(query: str, params: dict | None = None) -> None:
             "agent_commission_pct": params.get("pct"),
             "agent_commission_amount": params.get("cam"),
             "your_net_profit": params.get("net"),
-            "status": str(params.get("status", "ACTIVE")),
+            "status": str(params.get("status", "ACTIVE")).strip().upper(),
             "import_source": "PDF" if "'PDF'" in q or params.get("import_source") == "PDF" else "MANUAL",
             "period_label": params.get("period"),
             "created_at": created_at,
@@ -409,7 +429,6 @@ def run_sql(query: str, params: dict | None = None) -> None:
         mask = df["id"].astype("Int64") == rid
         if not mask.any():
             raise RuntimeError("Póliza no encontrada")
-        # Update known fields used in the app
         for col, key in [
             ("coverage_key", "ck"),
             ("days", "d"),
@@ -422,7 +441,6 @@ def run_sql(query: str, params: dict | None = None) -> None:
         ]:
             if key in params:
                 df.loc[mask, col] = params[key]
-        # status forced to ACTIVE by query
         df.loc[mask, "status"] = "ACTIVE"
         _save_table("policies", df)
         return
@@ -639,7 +657,6 @@ def read_speed_weekly_pdf(file) -> tuple[str | None, pd.DataFrame]:
 # =============================
 # UI COMPONENTS
 # =============================
-
 def render_logo():
     if LOGO_PATH.exists():
         st.sidebar.image(str(LOGO_PATH), use_container_width=True)
@@ -838,7 +855,8 @@ elif page == "Dashboard":
         """,
         {"a": week_start.isoformat(), "b": week_end.isoformat()},
     )
-    wA = df_week[df_week["status"] == "ACTIVE"].copy()
+    # ✅ FIX: ACT / ACTIVE / ACTIVO...
+    wA = df_week[is_active_status(df_week["status"])].copy()
 
     st.markdown("### Semana (actual)")
     st.caption(f"Semana (Dom–Sáb): {week_start} → {week_end}")
@@ -848,11 +866,7 @@ elif page == "Dashboard":
             ("Vendido semana", money(wA["price"].sum() if not wA.empty else 0), "PRICE"),
             ("Costo semana", money(wA["cost"].sum() if not wA.empty else 0), "Proveedor"),
             ("Agent semana", money(wA["agent_profit"].sum() if not wA.empty else 0), "Utilidad bruta"),
-            (
-                "Gestor semana",
-                money(wA["agent_commission_amount"].sum() if not wA.empty else 0),
-                "Comisión",
-            ),
+            ("Gestor semana", money(wA["agent_commission_amount"].sum() if not wA.empty else 0), "Comisión"),
         ]
     )
     chart_top_products(wA, "Pólizas más vendidas (semana)")
@@ -870,7 +884,8 @@ elif page == "Dashboard":
         """,
         {"a": month_start.isoformat(), "b": month_end.isoformat()},
     )
-    mA = df_month[df_month["status"] == "ACTIVE"].copy()
+    # ✅ FIX: ACT / ACTIVE / ACTIVO...
+    mA = df_month[is_active_status(df_month["status"])].copy()
 
     st.markdown("### Mes (actual)")
     st.caption(f"Mes: {month_start} → {month_end}")
@@ -880,11 +895,7 @@ elif page == "Dashboard":
             ("Vendido mes", money(mA["price"].sum() if not mA.empty else 0), "PRICE"),
             ("Costo mes", money(mA["cost"].sum() if not mA.empty else 0), "Proveedor"),
             ("Agent mes", money(mA["agent_profit"].sum() if not mA.empty else 0), "Utilidad bruta"),
-            (
-                "Gestor mes",
-                money(mA["agent_commission_amount"].sum() if not mA.empty else 0),
-                "Comisión",
-            ),
+            ("Gestor mes", money(mA["agent_commission_amount"].sum() if not mA.empty else 0), "Comisión"),
         ]
     )
     chart_top_products(mA, "Pólizas más vendidas (mes)")
@@ -895,7 +906,11 @@ elif page == "Dashboard":
         st.session_state.period_range = ((pd.Timestamp(today) - pd.Timedelta(days=30)).date(), today)
 
     st.markdown("### Periodo (personalizado)")
-    period = st.date_input("Selecciona el periodo (Desde → Hasta)", value=st.session_state.period_range, key="period_range")
+    period = st.date_input(
+        "Selecciona el periodo (Desde → Hasta)",
+        value=st.session_state.period_range,
+        key="period_range",
+    )
 
     if isinstance(period, (date, datetime)):
         st.warning("Selecciona un rango completo (Desde y Hasta).")
@@ -916,7 +931,8 @@ elif page == "Dashboard":
         """,
         {"a": p_start.isoformat(), "b": p_end.isoformat()},
     )
-    pA = df_period[df_period["status"] == "ACTIVE"].copy()
+    # ✅ FIX: ACT / ACTIVE / ACTIVO...
+    pA = df_period[is_active_status(df_period["status"])].copy()
 
     kpi_cards(
         [
@@ -924,11 +940,7 @@ elif page == "Dashboard":
             ("Vendido periodo", money(pA["price"].sum() if not pA.empty else 0), "PRICE"),
             ("Costo periodo", money(pA["cost"].sum() if not pA.empty else 0), "Proveedor"),
             ("Agent periodo", money(pA["agent_profit"].sum() if not pA.empty else 0), "Utilidad bruta"),
-            (
-                "Gestor periodo",
-                money(pA["agent_commission_amount"].sum() if not pA.empty else 0),
-                "Comisión",
-            ),
+            ("Gestor periodo", money(pA["agent_commission_amount"].sum() if not pA.empty else 0), "Comisión"),
         ]
     )
     chart_top_products(pA, "Pólizas más vendidas (periodo)")
@@ -1538,4 +1550,3 @@ elif page == "Pendientes":
             st.rerun()
         except Exception as e:
             st.error(f"No se pudo resolver. Error: {e}")
-
