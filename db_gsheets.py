@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Iterable
 
 import time
 import pandas as pd
@@ -83,7 +83,7 @@ def _coerce_types(table: str, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _to_cell(x: Any) -> str:
+def _to_cell(x) -> str:
     if x is None:
         return ""
     try:
@@ -94,7 +94,7 @@ def _to_cell(x: Any) -> str:
     return str(x)
 
 
-def _chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
+def _chunked(seq: list, size: int) -> Iterable[list]:
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
 
@@ -146,7 +146,7 @@ class SheetDB:
         self.cfg = cfg
         self._client = None
         self._ss = None
-        self._ws_cache: dict[str, Any] = {}
+        self._ws_cache: dict = {}
 
     @staticmethod
     def from_streamlit_secrets(secrets: dict) -> "SheetDB":
@@ -298,7 +298,7 @@ class SheetDB:
                 continue
         return mx
 
-    def append_rows_batch(self, name: str, rows: list[list[Any]], *, chunk_size: int = 250) -> None:
+    def append_rows_batch(self, name: str, rows: list, *, chunk_size: int = 250) -> None:
         """
         Appends rows to an existing worksheet in chunks.
         - No full-table reads/writes.
@@ -309,16 +309,13 @@ class SheetDB:
         self.ensure_header(name)
         ws = self._ws(name)
 
-        def _append(chunk: list[list[Any]]):
+        def _append(chunk: list):
             chunk2 = [[_to_cell(x) for x in r] for r in chunk]
             return ws.append_rows(chunk2, value_input_option="RAW")
 
         for chunk in _chunked(rows, chunk_size):
             _with_retry(lambda c=chunk: _append(c))
 
-    # ----------------------------
-    # ID helper (kept for small CRUD)
-    # ----------------------------
     def next_id(self, name: str) -> int:
         mx = self.max_int_in_col(name, "id")
         return mx + 1
