@@ -92,10 +92,12 @@ class SheetDB:
     """Google Sheets-backed storage.
 
     Expects worksheets named exactly:
-    providers, offices, agents, products, coverage_alias, policies
+      providers, offices, agents, products, coverage_alias, policies
 
-    Each worksheet should have a header row matching TABLE_COLUMNS.
-    If header differs, we DO NOT wipe data; we map columns safely.
+    Each worksheet must have a header row matching TABLE_COLUMNS.
+    If header mismatches:
+      - If sheet has NO data rows -> rebuild header
+      - If sheet HAS data rows -> DO NOT clear; map columns safely
     """
 
     def __init__(self, cfg: SheetConfig):
@@ -105,21 +107,15 @@ class SheetDB:
 
     @staticmethod
     def from_streamlit_secrets(secrets: dict) -> "SheetDB":
-        """Build from st.secrets.
-
-        Required:
-          - secrets["GSHEETS_SPREADSHEET_ID"]
-          - secrets["gcp_service_account"] (dict)
-        """
         sid = secrets.get("GSHEETS_SPREADSHEET_ID")
         sa = secrets.get("gcp_service_account")
         if not sid or not sa:
             raise RuntimeError(
-                "Faltan secretos. Agrega GSHEETS_SPREADSHEET_ID y gcp_service_account en secrets."
+                "Faltan secretos. Agrega GSHEETS_SPREADSHEET_ID y gcp_service_account en .streamlit/secrets.toml"
             )
-        return SheetDB(SheetConfig(spreadsheet_id=sid, credentials_json=dict(sa)))
+        return SheetDB(SheetConfig(spreadsheet_id=str(sid), credentials_json=dict(sa)))
 
-    def _connect(self) -> None:
+    def _connect(self):
         if self._client is not None and self._ss is not None:
             return
 
@@ -135,59 +131,60 @@ class SheetDB:
         self._ss = self._client.open_by_key(self.cfg.spreadsheet_id)
 
     def _ws(self, name: str):
+        if name not in TABLE_COLUMNS:
+            raise KeyError(f"Tabla desconocida: {name}")
+
         self._connect()
         try:
             return self._ss.worksheet(name)
         except Exception:
             # Create worksheet if missing
-            if name not in TABLE_COLUMNS:
-                raise KeyError(f"Tabla desconocida: {name}")
-            ws = self._ss.add_worksheet(title=name, rows=2000, cols=max(10, len(TABLE_COLUMNS[name]) + 5))
-            ws.append_row(TABLE_COLUMNS[name])
+            ws = self._ss.add_worksheet(title=name, rows=1000, cols=len(TABLE_COLUMNS[name]) + 5)
+            ws.update([TABLE_COLUMNS[name]])
             return ws
 
     def read_table(self, name: str) -> pd.DataFrame:
-        if name not in TABLE_COLUMNS:
-            raise KeyError(f"Tabla desconocida: {name}")
-
         ws = self._ws(name)
         values = ws.get_all_values()
 
-        # Sheet completamente vacío: crea header
+        expected = TABLE_COLUMNS[name]
+
+        # Sheet completely empty
         if not values:
-            ws.append_row(TABLE_COLUMNS[name])
-            return pd.DataFrame(columns=TABLE_COLUMNS[name])
+            ws.update([expected])
+            return pd.DataFrame(columns=expected)
 
         header = values[0]
-        expected = TABLE_COLUMNS[name]
         got = [h.strip() for h in header]
 
-        # Header distinto: NO borramos data si ya hay filas
+        # Header mismatch
         if got != expected:
-            # Si solo hay header, podemos corregir (aquí sí es seguro)
+            # If only header (or effectively no data), rebuild safely
             if len(values) <= 1:
                 ws.clear()
-                ws.append_row(expected)
+                ws.update([expected])
                 return pd.DataFrame(columns=expected)
 
-            # Si hay data, mapeamos columnas sin borrar
+            # If has data: DO NOT CLEAR. Map columns.
             rows = values[1:]
             df = pd.DataFrame(rows, columns=got)
 
-            # Asegura columnas esperadas
+            # Ensure expected columns exist
             for col in expected:
                 if col not in df.columns:
                     df[col] = ""
 
             df = df[expected]
-        else:
-            rows = values[1:]
-            df = pd.DataFrame(rows, columns=expected)
+            df = df.replace({"": pd.NA})
+            df = _coerce_types(name, df)
+            return df.reset_index(drop=True)
 
-        # Limpieza + tipos
+        # Header OK
+        rows = values[1:]
+        df = pd.DataFrame(rows, columns=expected)
         df = df.replace({"": pd.NA})
         df = _coerce_types(name, df)
-        return df
+        return df.reset_index(drop=True)
 
     def write_table(self, name: str, df: pd.DataFrame) -> None:
         if name not in TABLE_COLUMNS:
@@ -197,13 +194,13 @@ class SheetDB:
 
         out = df.copy()
 
-        # Ensure all columns exist
+        # Ensure columns and order
         for c in TABLE_COLUMNS[name]:
             if c not in out.columns:
                 out[c] = pd.NA
         out = out[TABLE_COLUMNS[name]]
 
-        # Si me intentan guardar vacío pero ya hay data, NO borro nada
+        # If trying to write empty but sheet already has data -> DO NOT wipe
         existing = ws.get_all_values()
         if out.empty and len(existing) > 1:
             return
