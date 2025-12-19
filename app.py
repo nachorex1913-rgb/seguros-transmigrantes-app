@@ -894,6 +894,58 @@ elif page == "Dashboard":
 
     chart_agents_month(month_start, month_end)
 
+    # =============================
+    # RANGO PERSONALIZADO (tercer visualizador)
+    # =============================
+    st.divider()
+    st.markdown("### Rango personalizado")
+
+    cR1, cR2, cR3 = st.columns([1, 1, 1])
+    default_from = month_start  # por defecto: inicio de mes
+    default_to = month_end      # por defecto: hoy
+
+    custom_from = cR1.date_input("Desde", value=default_from, key="dash_custom_from")
+    custom_to = cR2.date_input("Hasta", value=default_to, key="dash_custom_to")
+
+    status_mode = cR3.selectbox(
+        "Estatus",
+        ["Solo ACTIVE", "Todos"],
+        index=0,
+        key="dash_custom_status_mode",
+    )
+
+    if custom_from > custom_to:
+        st.error("La fecha 'Desde' no puede ser mayor que 'Hasta'.")
+    else:
+        df_custom = fetch_df(
+            """
+            SELECT status, price, cost, agent_profit, agent_commission_amount, coverage_key, days
+            FROM policies
+            WHERE sale_date BETWEEN :a AND :b
+            """,
+            {"a": custom_from.isoformat(), "b": custom_to.isoformat()},
+        )
+
+        if status_mode == "Solo ACTIVE":
+            cA = df_custom[is_active_status(df_custom["status"])].copy()
+        else:
+            cA = df_custom.copy()
+
+        st.caption(f"Rango: {custom_from} → {custom_to} | Registros: {len(cA)}")
+
+        kpi_cards(
+            [
+                ("Pólizas", f"{len(cA)}", "En el rango"),
+                ("Vendido", money(cA["price"].sum() if not cA.empty else 0), "PRICE"),
+                ("Costo", money(cA["cost"].sum() if not cA.empty else 0), "Proveedor"),
+                ("Agent", money(cA["agent_profit"].sum() if not cA.empty else 0), "Utilidad bruta"),
+                ("Gestor", money(cA["agent_commission_amount"].sum() if not cA.empty else 0), "Comisión"),
+            ]
+        )
+
+        chart_top_products(cA, "Pólizas más vendidas (rango)")
+
+
 elif page == "Proveedores":
     st.subheader("Proveedores")
 
