@@ -1441,16 +1441,212 @@ elif page == "Importar PDF":
                     f"Importación completa. Insertadas: {inserted} | Duplicadas omitidas: {skipped} | Aliases creados: {len(new_alias_rows)}"
                 )
                 st.rerun()
-if st.button("Importar"):
-    try:
-        # ===============================
-        # TODO EL CÓDIGO DE IMPORTACIÓN
-        # ===============================
+elif page == "Importar PDF":
+    st.subheader("Importar PDF (Speed)")
 
-        st.success("Importación completada correctamente")
+    providers = get_providers(active_only=True)
+    speed = providers[providers["code"] == "SPEED_USA"]
+    if speed.empty:
+        st.warning("No existe SPEED_USA. Créalo en Proveedores.")
+        st.stop()
+    speed_id = int(speed.iloc[0]["id"])
+
+    agents = get_agents(active_only=True)
+    if agents.empty:
+        st.warning("Primero crea al menos 1 gestor.")
+        st.stop()
+
+    col1, col2 = st.columns(2)
+    agent_id = col1.selectbox(
+        "Gestor (para asignar pólizas importadas)",
+        agents["id"].tolist(),
+        format_func=lambda x: agents.loc[agents["id"] == x, "name"].iloc[0],
+    )
+    default_pct = float(agents.loc[agents["id"] == agent_id, "default_commission_pct"].iloc[0])
+    commission_pct = col2.number_input(
+        "% comisión para esta importación", min_value=0.0, max_value=100.0, value=default_pct, step=0.5
+    )
+
+    up = st.file_uploader("Sube el PDF semanal", type=["pdf"])
+    if up is None:
+        st.stop()
+
+    try:
+        period, df = read_speed_weekly_pdf(up)
+        if df.empty:
+            st.error("No encontré filas de pólizas en el PDF (formato inesperado).")
+            st.stop()
+
+        st.write("Vista previa:")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption(f"Periodo detectado: {period or '(no detectado)'}")
 
     except Exception as e:
-        st.error(f"No pude leer/importar el PDF. Error: {e}")
+        st.error(f"No pude leer el PDF. Error: {e}")
+        st.stop()
+
+    if st.button("Importar", use_container_width=True):
+        try:
+            db = get_db()
+
+            # ---- Preload minimal data ONCE (no reads per row) ----
+            existing_policy_codes = set(
+                x.strip() for x in db.get_col_values("policies", "policy_code") if str(x).strip()
+            )
+            next_policy_id = db.max_int_in_col("policies", "id") + 1
+
+            offices_df = db.read_table("offices")
+            offices_map = {}
+            max_office_id = 0
+            if not offices_df.empty:
+                for _, rr in offices_df.iterrows():
+                    c = str(rr.get("code") or "").strip().upper()
+                    try:
+                        oid = int(rr.get("id"))
+                    except Exception:
+                        continue
+                    if c:
+                        offices_map[c] = oid
+                        if oid > max_office_id:
+                            max_office_id = oid
+            next_office_id = max_office_id + 1
+
+            alias_df = db.read_table("coverage_alias")
+            alias_map = {}
+            max_alias_id = 0
+            if not alias_df.empty:
+                # max id
+                for v in alias_df["id"].dropna().astype(str).tolist():
+                    try:
+                        max_alias_id = max(max_alias_id, int(v))
+                    except Exception:
+                        pass
+
+                tmp = alias_df[
+                    (alias_df["provider_id"].astype("Int64") == int(speed_id))
+                    & (alias_df["active"].fillna(0).astype(int) == 1)
+                ].copy()
+                for _, rr in tmp.iterrows():
+                    raw = str(rr.get("raw_coverage_text") or "").strip().upper()
+                    norm = str(rr.get("normalized_coverage_key") or "").strip().upper()
+                    if raw and norm:
+                        alias_map[raw] = norm
+
+            next_alias_id = max_alias_id + 1
+
+            products = get_products(speed_id, active_only=True)
+
+            # ---- Build rows in memory ----
+            inserted, skipped = 0, 0
+            new_office_rows = []
+            new_alias_rows = []
+            new_policy_rows = []
+
+            now_iso = datetime.now().isoformat(timespec="seconds")
+
+            policies_cols = TABLE_COLUMNS["policies"]
+            for _, r in df.iterrows():
+                pc = str(r["policy_code"]).strip()
+                if pc in existing_policy_codes:
+                    skipped += 1
+                    continue
+
+                # office id in-memory upsert
+                office_code = str(r["office_code"]).strip().upper()
+                if office_code and office_code in offices_map:
+                    office_id = offices_map[office_code]
+                else:
+                    office_id = next_office_id
+                    next_office_id += 1
+                    offices_map[office_code] = office_id
+                    new_office_rows.append([office_id, office_code, office_code])
+
+                raw_cov_full = normalize_coverage_key(r["raw_coverage_text"])
+
+                # Base key WITHOUT days (_jobs uses your extract)
+                cov_key_guess = str(r["coverage_key_guess"]).strip().upper()
+                days = int(r["days_guess"]) if pd.notna(r["days_guess"]) else None
+
+                # Opción 2: alias automático (si raw no existe, lo creamos con el guess)
+                if raw_cov_full not in alias_map:
+                    alias_map[raw_cov_full] = cov_key_guess
+                    new_alias_rows.append([next_alias_id, speed_id, raw_cov_full, cov_key_guess, 1])
+                    next_alias_id += 1
+
+                cov_key = alias_map.get(raw_cov_full, cov_key_guess)
+
+                # Match against products
+                match = pd.DataFrame()
+                if days is not None and not products.empty:
+                    match = products[(products["coverage_key"] == cov_key) & (products["days"] == days)]
+
+                if not match.empty:
+                    mrow = match.iloc[0]
+                    cost = float(mrow["cost"])
+                    ap = float(mrow["agent_profit"])
+                    price = float(mrow["price"])
+                    cam, net = compute_financials(ap, float(commission_pct))
+                    status = "ACTIVE"
+                    ck_store = cov_key
+                    days_store = days
+                    pct_store = float(commission_pct)
+                else:
+                    # NO match => PENDING, but we STILL store guessed key to avoid blanks
+                    cost = ""
+                    ap = ""
+                    price = float(r["price"]) if pd.notna(r["price"]) else ""
+                    cam, net = "", ""
+                    status = "PENDING"
+                    ck_store = cov_key  # <- nunca vacío
+                    days_store = days if days is not None else ""
+                    pct_store = ""
+
+                row_dict = {
+                    "id": next_policy_id,
+                    "policy_code": pc,
+                    "provider_id": speed_id,
+                    "office_id": office_id,
+                    "agent_id": int(agent_id),
+                    "sale_date": str(r["sale_date"]),
+                    "client_name": str(r["client_name"]) if pd.notna(r["client_name"]) else "",
+                    "raw_coverage_text": raw_cov_full,
+                    "coverage_key": ck_store,
+                    "days": int(days_store) if days_store != "" else "",
+                    "price": price,
+                    "cost": cost,
+                    "agent_profit": ap,
+                    "agent_commission_pct": pct_store,
+                    "agent_commission_amount": cam,
+                    "your_net_profit": net,
+                    "status": status,
+                    "import_source": "PDF",
+                    "period_label": period or "",
+                    "created_at": now_iso,
+                }
+
+                new_policy_rows.append([row_dict.get(c, "") for c in policies_cols])
+
+                existing_policy_codes.add(pc)
+                next_policy_id += 1
+                inserted += 1
+
+            # ---- Write ONCE (batch append) ----
+            if new_office_rows:
+                db.append_rows_batch("offices", new_office_rows, chunk_size=300)
+
+            if new_alias_rows:
+                db.append_rows_batch("coverage_alias", new_alias_rows, chunk_size=300)
+
+            if new_policy_rows:
+                db.append_rows_batch("policies", new_policy_rows, chunk_size=250)
+
+            st.success(
+                f"Importación completa. Insertadas: {inserted} | Duplicadas omitidas: {skipped} | Aliases creados: {len(new_alias_rows)}"
+            )
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"No pude importar. Error: {e}")
 
 elif page == "Pendientes":
     st.subheader("Pendientes")
