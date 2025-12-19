@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from gspread.exceptions import WorksheetNotFound, APIError
+
 
 TABLE_COLUMNS: dict[str, list[str]] = {
     "providers": ["id", "code", "name", "currency", "active"],
@@ -38,7 +40,6 @@ TABLE_COLUMNS: dict[str, list[str]] = {
 
 
 def _coerce_types(table: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Best-effort type coercion so comparisons work reliably."""
     if df.empty:
         return df
 
@@ -74,7 +75,6 @@ def _coerce_types(table: str, df: pd.DataFrame) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Optional integer columns that may contain nulls
     for c in ["office_id", "agent_id", "days"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
@@ -89,17 +89,6 @@ class SheetConfig:
 
 
 class SheetDB:
-    """Google Sheets-backed storage.
-
-    Expects worksheets named exactly:
-      providers, offices, agents, products, coverage_alias, policies
-
-    Each worksheet must have a header row matching TABLE_COLUMNS.
-    If header mismatches:
-      - If sheet has NO data rows -> rebuild header
-      - If sheet HAS data rows -> DO NOT clear; map columns safely
-    """
-
     def __init__(self, cfg: SheetConfig):
         self.cfg = cfg
         self._client = None
@@ -135,21 +124,30 @@ class SheetDB:
             raise KeyError(f"Tabla desconocida: {name}")
 
         self._connect()
+
+        # ✅ SOLO crear si de verdad no existe
         try:
             return self._ss.worksheet(name)
+        except WorksheetNotFound:
+            try:
+                ws = self._ss.add_worksheet(title=name, rows=1000, cols=len(TABLE_COLUMNS[name]) + 5)
+                ws.update([TABLE_COLUMNS[name]])
+                return ws
+            except APIError as e:
+                msg = str(e)
+                # ✅ Si la API dice "ya existe", abrirla
+                if "already exists" in msg or "A sheet with the name" in msg:
+                    return self._ss.worksheet(name)
+                raise
         except Exception:
-            # Create worksheet if missing
-            ws = self._ss.add_worksheet(title=name, rows=1000, cols=len(TABLE_COLUMNS[name]) + 5)
-            ws.update([TABLE_COLUMNS[name]])
-            return ws
+            # ✅ Cualquier otro error NO es "missing sheet"
+            raise
 
     def read_table(self, name: str) -> pd.DataFrame:
         ws = self._ws(name)
         values = ws.get_all_values()
-
         expected = TABLE_COLUMNS[name]
 
-        # Sheet completely empty
         if not values:
             ws.update([expected])
             return pd.DataFrame(columns=expected)
@@ -157,32 +155,23 @@ class SheetDB:
         header = values[0]
         got = [h.strip() for h in header]
 
-        # Header mismatch
         if got != expected:
-            # If only header (or effectively no data), rebuild safely
             if len(values) <= 1:
                 ws.clear()
                 ws.update([expected])
                 return pd.DataFrame(columns=expected)
 
-            # If has data: DO NOT CLEAR. Map columns.
             rows = values[1:]
             df = pd.DataFrame(rows, columns=got)
-
-            # Ensure expected columns exist
             for col in expected:
                 if col not in df.columns:
                     df[col] = ""
-
-            df = df[expected]
-            df = df.replace({"": pd.NA})
+            df = df[expected].replace({"": pd.NA})
             df = _coerce_types(name, df)
             return df.reset_index(drop=True)
 
-        # Header OK
         rows = values[1:]
-        df = pd.DataFrame(rows, columns=expected)
-        df = df.replace({"": pd.NA})
+        df = pd.DataFrame(rows, columns=expected).replace({"": pd.NA})
         df = _coerce_types(name, df)
         return df.reset_index(drop=True)
 
@@ -193,14 +182,11 @@ class SheetDB:
         ws = self._ws(name)
 
         out = df.copy()
-
-        # Ensure columns and order
         for c in TABLE_COLUMNS[name]:
             if c not in out.columns:
                 out[c] = pd.NA
         out = out[TABLE_COLUMNS[name]]
 
-        # If trying to write empty but sheet already has data -> DO NOT wipe
         existing = ws.get_all_values()
         if out.empty and len(existing) > 1:
             return
@@ -215,9 +201,7 @@ class SheetDB:
                 pass
             return str(x)
 
-        values = [TABLE_COLUMNS[name]]
-        for row in out.itertuples(index=False):
-            values.append([_to_cell(v) for v in row])
+        values = [TABLE_COLUMNS[name]] + [[_to_cell(v) for v in row] for row in out.itertuples(index=False)]
 
         ws.clear()
         ws.update(values)
