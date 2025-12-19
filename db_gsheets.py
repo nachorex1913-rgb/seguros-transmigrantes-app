@@ -119,7 +119,6 @@ def _with_retry(fn, *, max_tries: int = 6, base_sleep: float = 1.2):
                 raise
             time.sleep(base_sleep * (2 ** (i - 1)))
         except Exception as e:
-            # If it looks like quota, retry; else raise
             last = e
             if not _is_quota_429(e) or i == max_tries:
                 raise
@@ -223,7 +222,6 @@ class SheetDB:
         got = [h.strip() for h in header]
 
         if got != expected:
-            # If header mismatched but there is data, align columns safely
             rows = values[1:]
             if not rows:
                 return pd.DataFrame(columns=expected)
@@ -242,8 +240,8 @@ class SheetDB:
 
     def write_table(self, name: str, df: pd.DataFrame) -> None:
         """
-        OJO: Esto reescribe toda la hoja (bien para pantallas CRUD pequeñas).
-        Para import masivo usa append_rows_batch().
+        Reescribe toda la hoja (bien para CRUD pequeño).
+        Import masivo usa append_rows_batch().
         """
         if name not in TABLE_COLUMNS:
             raise KeyError(f"Tabla desconocida: {name}")
@@ -286,7 +284,6 @@ class SheetDB:
         ws = self._ws(name)
         idx = self.col_index(name, col_name)
         col = _with_retry(lambda: ws.col_values(idx))
-        # remove header
         return col[1:] if len(col) > 1 else []
 
     def max_int_in_col(self, name: str, col_name: str) -> int:
@@ -313,7 +310,6 @@ class SheetDB:
         ws = self._ws(name)
 
         def _append(chunk: list[list[Any]]):
-            # normalize to strings
             chunk2 = [[_to_cell(x) for x in r] for r in chunk]
             return ws.append_rows(chunk2, value_input_option="RAW")
 
