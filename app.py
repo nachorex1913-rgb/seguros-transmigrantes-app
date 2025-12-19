@@ -1441,11 +1441,12 @@ elif page == "Importar PDF":
                     f"Importación completa. Insertadas: {inserted} | Duplicadas omitidas: {skipped} | Aliases creados: {len(new_alias_rows)}"
                 )
                 st.rerun()
-try:
-    ...
-    ...
-if st.button("Importar"):   # ❌ Python todavía espera except/finally
-    ...
+if st.button("Importar"):
+    try:
+        # ===============================
+        # TODO EL CÓDIGO DE IMPORTACIÓN
+        # ===============================
+
         st.success("Importación completada correctamente")
 
     except Exception as e:
