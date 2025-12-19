@@ -1178,8 +1178,8 @@ elif page == "Importar PDF":
 
                 # ---- Build rows in memory ----
                 inserted, skipped = 0, 0
-                new_office_rows: list[list[Any]] = []
-                new_policy_rows: list[list[Any]] = []
+                new_office_rows = []
+                new_policy_rows = []
 
                 now_iso = datetime.now().isoformat(timespec="seconds")
 
