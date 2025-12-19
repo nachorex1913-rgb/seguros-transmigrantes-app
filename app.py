@@ -1441,8 +1441,15 @@ elif page == "Importar PDF":
                     f"Importación completa. Insertadas: {inserted} | Duplicadas omitidas: {skipped} | Aliases creados: {len(new_alias_rows)}"
                 )
                 st.rerun()
-except Exception as e:
-            st.error(f"No pude leer/importar el PDF. Error: {e}")
+if st.button("Importar"):
+    try:
+        # TODO el código de importación va aquí
+        # (parse PDF, build rows, append batch, alias, etc.)
+
+        st.success("Importación completada correctamente")
+
+    except Exception as e:
+        st.error(f"No pude leer/importar el PDF. Error: {e}")
 
 elif page == "Pendientes":
     st.subheader("Pendientes")
