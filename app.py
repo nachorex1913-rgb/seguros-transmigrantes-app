@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 import pdfplumber
 
-from db_gsheets import SheetDB, TABLE_COLUMNS
+from db_gsheets import SheetDB
 
 # ======================
 # CONFIGURACIÓN LOGIN PIN
@@ -62,11 +62,13 @@ def get_db() -> SheetDB:
 
 
 def _load_table(name: str) -> pd.DataFrame:
+    # cache per-table for snappy UI; cleared on every write
     return get_db().read_table(name)
 
 
 def _save_table(name: str, df: pd.DataFrame) -> None:
     get_db().write_table(name, df)
+    # Clear cache so UI refreshes
     st.cache_data.clear()
 
 
@@ -98,11 +100,13 @@ def compute_financials(agent_profit: float, commission_pct: float):
     return commission_amount, your_net
 
 
+# ✅ FIX: status flexible (ACT / ACTIVE / ACTIVO / espacios)
 def normalize_status_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.upper()
 
 
 def is_active_status(s: pd.Series) -> pd.Series:
+    # Considera "ACT", "ACTIVE", "ACTIVO", "ACTIVA", etc.
     return normalize_status_series(s).str.startswith("ACT")
 
 
@@ -118,6 +122,8 @@ def week_bounds_from_any_day(d: date):
 
 # =============================
 # DB-LIKE HELPERS (Sheets-backed)
+# We keep the rest of the app almost identical by routing the limited
+# SQL strings used in the original version.
 # =============================
 
 def scalar(query: str, params: dict | None = None):
@@ -200,12 +206,14 @@ def fetch_df(query: str, params: dict | None = None) -> pd.DataFrame:
         return df[cols].reset_index(drop=True)
 
     if q.startswith("SELECT COALESCE(a.name,'(sin gestor)') AS gestor, SUM(p.price) AS vendido FROM policies p"):
+        # Sales by agent for month
         pol = _load_table("policies")
         ag = _load_table("agents")
         a = str(params["a"])
         b = str(params["b"])
 
         pol = pol[(pol["sale_date"].astype(str) >= a) & (pol["sale_date"].astype(str) <= b)]
+        # ✅ FIX: status activo flexible
         pol = pol[is_active_status(pol["status"])]
 
         merged = pol.merge(
@@ -221,6 +229,7 @@ def fetch_df(query: str, params: dict | None = None) -> pd.DataFrame:
         return out
 
     if q.startswith("SELECT COUNT(*) FROM "):
+        # Counts for dashboard
         table = q.replace("SELECT COUNT(*) FROM ", "").strip()
         if " WHERE " in table:
             table, where = table.split(" WHERE ", 1)
@@ -249,6 +258,7 @@ def fetch_df(query: str, params: dict | None = None) -> pd.DataFrame:
         return pd.DataFrame([[n]])
 
     if "FROM products p" in q and "JOIN providers" in q:
+        # Tarifas page joined view
         pid = int(params["pid"])
         prod = _load_table("products")
         prov = _load_table("providers")
@@ -271,10 +281,6 @@ def fetch_df(query: str, params: dict | None = None) -> pd.DataFrame:
 
 
 def run_sql(query: str, params: dict | None = None) -> None:
-    """
-    Mantiene el CRUD de pantallas (volúmenes bajos).
-    Import PDF NO usa run_sql (para evitar 429).
-    """
     params = params or {}
     q = " ".join(query.strip().split())
 
@@ -289,6 +295,7 @@ def run_sql(query: str, params: dict | None = None) -> None:
             "currency": str(params["currency"]),
             "active": int(params.get("active", 1)),
         }
+        # uniqueness by code
         if not df.empty and (df["code"].astype(str) == row["code"]).any():
             raise RuntimeError("Provider code ya existe")
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
@@ -351,6 +358,7 @@ def run_sql(query: str, params: dict | None = None) -> None:
             "price": float(params["p"]),
             "active": int(params.get("active", 1)),
         }
+        # uniqueness by (provider_id, coverage_key, days)
         if not df.empty:
             m = (
                 (df["provider_id"].astype("Int64") == row["provider_id"])
@@ -847,6 +855,7 @@ elif page == "Dashboard":
         """,
         {"a": week_start.isoformat(), "b": week_end.isoformat()},
     )
+    # ✅ FIX: ACT / ACTIVE / ACTIVO...
     wA = df_week[is_active_status(df_week["status"])].copy()
 
     st.markdown("### Semana (actual)")
@@ -875,6 +884,7 @@ elif page == "Dashboard":
         """,
         {"a": month_start.isoformat(), "b": month_end.isoformat()},
     )
+    # ✅ FIX: ACT / ACTIVE / ACTIVO...
     mA = df_month[is_active_status(df_month["status"])].copy()
 
     st.markdown("### Mes (actual)")
@@ -892,59 +902,52 @@ elif page == "Dashboard":
 
     st.divider()
 
-    chart_agents_month(month_start, month_end)
+    if "period_range" not in st.session_state:
+        st.session_state.period_range = ((pd.Timestamp(today) - pd.Timedelta(days=30)).date(), today)
 
-    # =============================
-    # RANGO PERSONALIZADO (tercer visualizador)
-    # =============================
-    st.divider()
-    st.markdown("### Rango personalizado")
-
-    cR1, cR2, cR3 = st.columns([1, 1, 1])
-    default_from = month_start  # por defecto: inicio de mes
-    default_to = month_end      # por defecto: hoy
-
-    custom_from = cR1.date_input("Desde", value=default_from, key="dash_custom_from")
-    custom_to = cR2.date_input("Hasta", value=default_to, key="dash_custom_to")
-
-    status_mode = cR3.selectbox(
-        "Estatus",
-        ["Solo ACTIVE", "Todos"],
-        index=0,
-        key="dash_custom_status_mode",
+    st.markdown("### Periodo (personalizado)")
+    period = st.date_input(
+        "Selecciona el periodo (Desde → Hasta)",
+        value=st.session_state.period_range,
+        key="period_range",
     )
 
-    if custom_from > custom_to:
-        st.error("La fecha 'Desde' no puede ser mayor que 'Hasta'.")
-    else:
-        df_custom = fetch_df(
-            """
-            SELECT status, price, cost, agent_profit, agent_commission_amount, coverage_key, days
-            FROM policies
-            WHERE sale_date BETWEEN :a AND :b
-            """,
-            {"a": custom_from.isoformat(), "b": custom_to.isoformat()},
-        )
+    if isinstance(period, (date, datetime)):
+        st.warning("Selecciona un rango completo (Desde y Hasta).")
+        st.stop()
 
-        if status_mode == "Solo ACTIVE":
-            cA = df_custom[is_active_status(df_custom["status"])].copy()
-        else:
-            cA = df_custom.copy()
+    p_start, p_end = period
+    if p_end < p_start:
+        st.error("El 'Hasta' no puede ser menor que el 'Desde'.")
+        st.stop()
 
-        st.caption(f"Rango: {custom_from} → {custom_to} | Registros: {len(cA)}")
+    st.caption(f"Periodo seleccionado: {p_start} → {p_end}")
 
-        kpi_cards(
-            [
-                ("Pólizas", f"{len(cA)}", "En el rango"),
-                ("Vendido", money(cA["price"].sum() if not cA.empty else 0), "PRICE"),
-                ("Costo", money(cA["cost"].sum() if not cA.empty else 0), "Proveedor"),
-                ("Agent", money(cA["agent_profit"].sum() if not cA.empty else 0), "Utilidad bruta"),
-                ("Gestor", money(cA["agent_commission_amount"].sum() if not cA.empty else 0), "Comisión"),
-            ]
-        )
+    df_period = fetch_df(
+        """
+        SELECT status, price, cost, agent_profit, agent_commission_amount, coverage_key, days
+        FROM policies
+        WHERE sale_date BETWEEN :a AND :b
+        """,
+        {"a": p_start.isoformat(), "b": p_end.isoformat()},
+    )
+    # ✅ FIX: ACT / ACTIVE / ACTIVO...
+    pA = df_period[is_active_status(df_period["status"])].copy()
 
-        chart_top_products(cA, "Pólizas más vendidas (rango)")
+    kpi_cards(
+        [
+            ("Pólizas periodo", f"{len(pA)}", "ACTIVE"),
+            ("Vendido periodo", money(pA["price"].sum() if not pA.empty else 0), "PRICE"),
+            ("Costo periodo", money(pA["cost"].sum() if not pA.empty else 0), "Proveedor"),
+            ("Agent periodo", money(pA["agent_profit"].sum() if not pA.empty else 0), "Utilidad bruta"),
+            ("Gestor periodo", money(pA["agent_commission_amount"].sum() if not pA.empty else 0), "Comisión"),
+        ]
+    )
+    chart_top_products(pA, "Pólizas más vendidas (periodo)")
 
+    st.divider()
+
+    chart_agents_month(month_start, month_end)
 
 elif page == "Proveedores":
     st.subheader("Proveedores")
@@ -981,6 +984,34 @@ elif page == "Proveedores":
                 st.rerun()
             except Exception as e:
                 st.error(f"No se pudo guardar. Error: {e}")
+
+    st.markdown("### Editar / desactivar")
+    if not df.empty:
+        sel_id = st.selectbox(
+            "Selecciona proveedor",
+            df["id"].tolist(),
+            format_func=lambda pid: f"{df.loc[df['id']==pid,'code'].iloc[0]} — {df.loc[df['id']==pid,'name'].iloc[0]}",
+        )
+        row = df[df["id"] == sel_id].iloc[0]
+        with st.form("edit_provider"):
+            new_name = st.text_input("Nombre", value=row["name"])
+            new_currency = st.selectbox("Moneda", ["USD", "MXN"], index=0 if row["currency"] == "USD" else 1)
+            new_active = st.checkbox("Activo", value=bool(row["active"]))
+            save = st.form_submit_button("Actualizar")
+        if save:
+            try:
+                run_sql(
+                    """
+                    UPDATE providers
+                    SET name=:name, currency=:currency, active=:active
+                    WHERE id=:id
+                    """,
+                    {"id": int(sel_id), "name": new_name, "currency": new_currency, "active": 1 if new_active else 0},
+                )
+                st.success("Proveedor actualizado.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo actualizar. Error: {e}")
 
 elif page == "Gestores":
     st.subheader("Gestores")
@@ -1048,6 +1079,72 @@ elif page == "Tarifas":
         st.dataframe(show, use_container_width=True, hide_index=True)
     else:
         st.info("No hay tarifas aún para este proveedor.")
+
+    st.divider()
+    st.markdown("### Carga masiva (pegar CSV)")
+    st.caption("Formato: coverage_key,days,cost,agent_profit,price (sin $)")
+    csv_text = st.text_area("Pega aquí tu CSV", height=220)
+
+    if st.button("Importar CSV", use_container_width=True):
+        if not csv_text.strip():
+            st.warning("Pega el CSV primero.")
+        else:
+            try:
+                df_in = pd.read_csv(pd.io.common.StringIO(csv_text))
+                required = {"coverage_key", "days", "cost", "agent_profit", "price"}
+                if not required.issubset(set(df_in.columns)):
+                    st.error(f"Faltan columnas. Requiere: {sorted(required)}")
+                else:
+                    df_in["coverage_key"] = df_in["coverage_key"].astype(str).map(normalize_coverage_key)
+                    df_in["days"] = df_in["days"].astype(int)
+                    df_in["cost"] = df_in["cost"].astype(float)
+                    df_in["agent_profit"] = df_in["agent_profit"].astype(float)
+                    df_in["price"] = df_in["price"].astype(float)
+
+                    inserted, updated = 0, 0
+                    for _, r in df_in.iterrows():
+                        exists = fetch_df(
+                            "SELECT id FROM products WHERE provider_id=:pid AND coverage_key=:ck AND days=:d",
+                            {"pid": int(pid), "ck": r["coverage_key"], "d": int(r["days"])},
+                        )
+                        if exists.empty:
+                            run_sql(
+                                """
+                                INSERT INTO products (provider_id, coverage_key, days, cost, agent_profit, price, active)
+                                VALUES (:pid,:ck,:d,:c,:ap,:p,1)
+                                """,
+                                {
+                                    "pid": int(pid),
+                                    "ck": r["coverage_key"],
+                                    "d": int(r["days"]),
+                                    "c": float(r["cost"]),
+                                    "ap": float(r["agent_profit"]),
+                                    "p": float(r["price"]),
+                                },
+                            )
+                            inserted += 1
+                        else:
+                            run_sql(
+                                """
+                                UPDATE products
+                                SET cost=:c, agent_profit=:ap, price=:p, active=1
+                                WHERE provider_id=:pid AND coverage_key=:ck AND days=:d
+                                """,
+                                {
+                                    "pid": int(pid),
+                                    "ck": r["coverage_key"],
+                                    "d": int(r["days"]),
+                                    "c": float(r["cost"]),
+                                    "ap": float(r["agent_profit"]),
+                                    "p": float(r["price"]),
+                                },
+                            )
+                            updated += 1
+
+                    st.success(f"Listo. Insertadas: {inserted} | Actualizadas: {updated}")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo importar. Error: {e}")
 
 elif page == "Registrar póliza":
     st.subheader("Registrar póliza")
@@ -1189,14 +1286,16 @@ elif page == "Importar PDF":
             if st.button("Importar", use_container_width=True):
                 db = get_db()
 
-                # ---- Preload minimal data ONCE (no reads per row) ----
-                # Existing policy codes + max policy id
-                existing_policy_codes = set(x.strip() for x in db.get_col_values("policies", "policy_code") if str(x).strip())
+                # ---- Preload data ONCE (0 lecturas por fila) ----
+                existing_policy_codes = set(
+                    x.strip()
+                    for x in db.get_col_values("policies", "policy_code")
+                    if str(x).strip()
+                )
                 next_policy_id = db.max_int_in_col("policies", "id") + 1
 
-                # Offices map + max office id
                 offices_df = db.read_table("offices")
-                offices_map: dict[str, int] = {}
+                offices_map = {}
                 max_office_id = 0
                 if not offices_df.empty:
                     for _, rr in offices_df.iterrows():
@@ -1211,32 +1310,40 @@ elif page == "Importar PDF":
                                 max_office_id = oid
                 next_office_id = max_office_id + 1
 
-                # Alias map for SPEED_USA
                 alias_df = db.read_table("coverage_alias")
-                alias_map: dict[str, str] = {}
+                alias_map = {}
+                max_alias_id = 0
                 if not alias_df.empty:
-                    tmp = alias_df[
-                        (alias_df["provider_id"].astype("Int64") == int(speed_id))
-                        & (alias_df["active"].fillna(0).astype(int) == 1)
-                    ].copy()
-                    for _, rr in tmp.iterrows():
+                    for _, rr in alias_df.iterrows():
+                        try:
+                            aid = int(rr.get("id"))
+                            if aid > max_alias_id:
+                                max_alias_id = aid
+                        except Exception:
+                            pass
+
+                        if int(rr.get("provider_id") or 0) != int(speed_id):
+                            continue
+                        if int(rr.get("active") or 0) != 1:
+                            continue
                         raw = str(rr.get("raw_coverage_text") or "").strip().upper()
                         norm = str(rr.get("normalized_coverage_key") or "").strip().upper()
                         if raw and norm:
                             alias_map[raw] = norm
+                next_alias_id = max_alias_id + 1
 
-                # Products for SPEED once
                 products = get_products(speed_id, active_only=True)
 
                 # ---- Build rows in memory ----
                 inserted, skipped = 0, 0
                 new_office_rows = []
+                new_alias_rows = []
                 new_policy_rows = []
 
                 now_iso = datetime.now().isoformat(timespec="seconds")
-
                 policies_cols = TABLE_COLUMNS["policies"]
                 offices_cols = TABLE_COLUMNS["offices"]
+                alias_cols = TABLE_COLUMNS["coverage_alias"]
 
                 for _, r in df.iterrows():
                     pc = str(r["policy_code"]).strip()
@@ -1244,7 +1351,7 @@ elif page == "Importar PDF":
                         skipped += 1
                         continue
 
-                    # office id in-memory upsert
+                    # Office upsert in-memory (sin leer Sheets por fila)
                     office_code = str(r["office_code"]).strip().upper()
                     if office_code and office_code in offices_map:
                         office_id = offices_map[office_code]
@@ -1256,9 +1363,15 @@ elif page == "Importar PDF":
 
                     raw_cov = normalize_coverage_key(r["raw_coverage_text"])
 
-                    # alias lookup (no read)
+                    # Alias lookup (sin leer Sheets por fila)
                     cov_key = alias_map.get(raw_cov, str(r["coverage_key_guess"]).strip().upper())
                     days = int(r["days_guess"]) if pd.notna(r["days_guess"]) else None
+
+                    # Opción 2: crear alias automáticamente cuando no exista (para revisión/normalización luego)
+                    if raw_cov and raw_cov not in alias_map:
+                        new_alias_rows.append([next_alias_id, int(speed_id), raw_cov, cov_key, 1])
+                        alias_map[raw_cov] = cov_key
+                        next_alias_id += 1
 
                     match = pd.DataFrame()
                     if days is not None and not products.empty:
@@ -1275,20 +1388,21 @@ elif page == "Importar PDF":
                         days_store = days
                         pct_store = float(commission_pct)
                     else:
+                        # Sin tarifa -> PENDING, pero guardamos el guess para que no quede vacío
                         cost = None
                         ap = None
                         price = float(r["price"]) if pd.notna(r["price"]) else None
                         cam, net = None, None
                         status = "PENDING"
-                        ck_store = None
+                        ck_store = cov_key
                         days_store = days
                         pct_store = None
 
                     row_dict = {
                         "id": next_policy_id,
                         "policy_code": pc,
-                        "provider_id": speed_id,
-                        "office_id": office_id,
+                        "provider_id": int(speed_id),
+                        "office_id": int(office_id) if office_id else "",
                         "agent_id": int(agent_id),
                         "sale_date": str(r["sale_date"]),
                         "client_name": str(r["client_name"]) if pd.notna(r["client_name"]) else "",
@@ -1317,11 +1431,188 @@ elif page == "Importar PDF":
                 if new_office_rows:
                     db.append_rows_batch("offices", new_office_rows, chunk_size=300)
 
+                if new_alias_rows:
+                    db.append_rows_batch("coverage_alias", new_alias_rows, chunk_size=300)
+
                 if new_policy_rows:
                     db.append_rows_batch("policies", new_policy_rows, chunk_size=250)
 
-                st.success(f"Importación completa. Insertadas: {inserted} | Duplicadas omitidas: {skipped}")
+                st.success(
+                    f"Importación completa. Insertadas: {inserted} | Duplicadas omitidas: {skipped} | Aliases creados: {len(new_alias_rows)}"
+                )
                 st.rerun()
-
-        except Exception as e:
+except Exception as e:
             st.error(f"No pude leer/importar el PDF. Error: {e}")
+
+elif page == "Pendientes":
+    st.subheader("Pendientes")
+
+    providers = get_providers(active_only=True)
+    if providers.empty:
+        st.warning("No hay proveedores activos.")
+        st.stop()
+
+    pid = st.selectbox(
+        "Proveedor",
+        providers["id"].tolist(),
+        format_func=lambda x: providers.loc[providers["id"] == x, "code"].iloc[0],
+    )
+
+    products = get_products(int(pid), active_only=True)
+    if products.empty:
+        st.warning("Este proveedor no tiene tarifas. Carga Tarifas primero.")
+        st.stop()
+
+    pend = fetch_df(
+        """
+        SELECT id, policy_code, sale_date, client_name, raw_coverage_text, price, agent_id
+        FROM policies
+        WHERE status='PENDING' AND provider_id=:pid
+        ORDER BY sale_date DESC
+        """,
+        {"pid": int(pid)},
+    )
+
+    if pend.empty:
+        st.success("No hay pendientes.")
+        st.stop()
+
+    if st.button("⚡ Auto-resolver lo que ya matchee tarifa", use_container_width=True):
+        fixed = 0
+        for _, rr in pend.iterrows():
+            rid = int(rr["id"])
+            raw = rr["raw_coverage_text"]
+            gk, gd, _ = extract_days_and_key(raw)
+            gk = normalize_coverage_key(gk)
+            if gd is None:
+                continue
+
+            m = products[(products["coverage_key"] == gk) & (products["days"] == int(gd))]
+            if m.empty:
+                continue
+
+            mrow = m.iloc[0]
+            cost = float(mrow["cost"])
+            ap = float(mrow["agent_profit"])
+            price = float(mrow["price"])
+
+            pct = 20.0
+            if rr["agent_id"] is not None and pd.notna(rr["agent_id"]):
+                a = fetch_df("SELECT default_commission_pct FROM agents WHERE id=:id", {"id": int(rr["agent_id"])})
+                if not a.empty:
+                    pct = float(a.iloc[0]["default_commission_pct"])
+
+            cam, net = compute_financials(ap, pct)
+
+            run_sql(
+                """
+                UPDATE policies
+                SET coverage_key=:ck, days=:d,
+                    cost=:c, agent_profit=:ap, price=:p,
+                    agent_commission_pct=:pct, agent_commission_amount=:cam, your_net_profit=:net,
+                    status='ACTIVE'
+                WHERE id=:id
+                """,
+                {"ck": gk, "d": int(gd), "c": cost, "ap": ap, "p": price, "pct": pct, "cam": cam, "net": net, "id": rid},
+            )
+
+            run_sql(
+                """
+                INSERT OR IGNORE INTO coverage_alias (provider_id, raw_coverage_text, normalized_coverage_key, active)
+                VALUES (:pid, :raw, :ck, 1)
+                """,
+                {"pid": int(pid), "raw": normalize_coverage_key(raw), "ck": gk},
+            )
+
+            fixed += 1
+
+        st.success(f"Auto-resueltas: {fixed}")
+        st.rerun()
+
+    st.markdown("### Lista de pendientes")
+    show = pend.copy()
+    show["price"] = show["price"].map(money)
+    st.dataframe(show.drop(columns=["agent_id"]), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Resolver una póliza (con sugerencia automática)")
+
+    row_id = st.selectbox(
+        "Selecciona",
+        pend["id"].tolist(),
+        format_func=lambda x: f"{pend.loc[pend['id']==x,'policy_code'].iloc[0]} — {pend.loc[pend['id']==x,'raw_coverage_text'].iloc[0]}",
+    )
+    raw_text = pend.loc[pend["id"] == row_id, "raw_coverage_text"].iloc[0]
+
+    guess_key, guess_days, _ = extract_days_and_key(raw_text)
+    guess_key = normalize_coverage_key(guess_key)
+
+    ids = products["id"].tolist()
+    default_index = 0
+    if guess_days is not None:
+        match_ids = products[(products["coverage_key"] == guess_key) & (products["days"] == int(guess_days))]["id"].tolist()
+        if match_ids:
+            default_index = ids.index(match_ids[0])
+
+    product_choice = st.selectbox(
+        "Cobertura sugerida (puedes cambiarla si hace falta)",
+        ids,
+        index=default_index,
+        format_func=lambda x: f"{products.loc[products['id']==x,'coverage_key'].iloc[0]} — {int(products.loc[products['id']==x,'days'].iloc[0])} días",
+    )
+    mrow = products[products["id"] == product_choice].iloc[0]
+
+    pol_agent = pend.loc[pend["id"] == row_id, "agent_id"].iloc[0]
+    pct = 20.0
+    if pol_agent is not None and pd.notna(pol_agent):
+        a = fetch_df("SELECT default_commission_pct FROM agents WHERE id=:id", {"id": int(pol_agent)})
+        if not a.empty:
+            pct = float(a.iloc[0]["default_commission_pct"])
+
+    commission_pct = st.number_input("% comisión", min_value=0.0, max_value=100.0, value=float(pct), step=0.5)
+
+    st.caption(f"Sugerencia detectada desde RAW: {guess_key} — {guess_days} días")
+
+    if st.button("Activar + crear alias", use_container_width=True):
+        try:
+            cov_key = mrow["coverage_key"]
+            days = int(mrow["days"])
+            cost = float(mrow["cost"])
+            ap = float(mrow["agent_profit"])
+            price = float(mrow["price"])
+            cam, net = compute_financials(ap, float(commission_pct))
+
+            run_sql(
+                """
+                UPDATE policies
+                SET coverage_key=:ck, days=:d,
+                    cost=:c, agent_profit=:ap, price=:p,
+                    agent_commission_pct=:pct, agent_commission_amount=:cam, your_net_profit=:net,
+                    status='ACTIVE'
+                WHERE id=:id
+                """,
+                {
+                    "ck": cov_key,
+                    "d": days,
+                    "c": cost,
+                    "ap": ap,
+                    "p": price,
+                    "pct": float(commission_pct),
+                    "cam": float(cam),
+                    "net": float(net),
+                    "id": int(row_id),
+                },
+            )
+
+            run_sql(
+                """
+                INSERT OR IGNORE INTO coverage_alias (provider_id, raw_coverage_text, normalized_coverage_key, active)
+                VALUES (:pid, :raw, :ck, 1)
+                """,
+                {"pid": int(pid), "raw": normalize_coverage_key(raw_text), "ck": cov_key},
+            )
+
+            st.success("Póliza activada y alias creado.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo resolver. Error: {e}")
