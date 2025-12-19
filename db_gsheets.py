@@ -144,13 +144,40 @@ class SheetDB:
             return ws
 
     def read_table(self, name: str) -> pd.DataFrame:
-        if name not in TABLE_COLUMNS:
-            raise KeyError(f"Tabla desconocida: {name}")
-        ws = self._ws(name)
-        values = ws.get_all_values()
-        if not values:
-            ws.append_row(TABLE_COLUMNS[name])
-            return pd.DataFrame(columns=TABLE_COLUMNS[name])
+    ws = self.ws(name)
+    values = ws.get_all_values()
+
+    # Si la hoja está totalmente vacía
+    if not values:
+        ws.append_row(TABLE_COLUMNS[name])
+        return pd.DataFrame(columns=TABLE_COLUMNS[name])
+
+    header = values[0]
+    expected = TABLE_COLUMNS[name]
+    got = [h.strip() for h in header]
+
+    # Header distinto
+    if got != expected:
+        # Si solo hay header, se puede reconstruir
+        if len(values) <= 1:
+            ws.clear()
+            ws.append_row(expected)
+            return pd.DataFrame(columns=expected)
+
+        # Si ya hay data, NO borrar: mapear columnas
+        rows = values[1:]
+        df = pd.DataFrame(rows, columns=got)
+
+        for col in expected:
+            if col not in df.columns:
+                df[col] = ""
+
+        return df[expected]
+
+    # Header correcto
+    rows = values[1:]
+    return pd.DataFrame(rows, columns=expected)
+
 
 header = values[0]
 
