@@ -153,11 +153,29 @@ class SheetDB:
             return pd.DataFrame(columns=TABLE_COLUMNS[name])
 
         header = values[0]
-        # If header is wrong/empty, rewrite it
-        if [h.strip() for h in header] != TABLE_COLUMNS[name]:
-            ws.clear()
-            ws.append_row(TABLE_COLUMNS[name])
-            return pd.DataFrame(columns=TABLE_COLUMNS[name])
+expected = TABLE_COLUMNS[name]
+got = [h.strip() for h in header]
+
+# Si el header no coincide, NO borres data si ya hay filas
+if got != expected:
+    # Si la hoja solo tiene 1 fila (solo header), ahí sí podemos corregir
+    if len(values) <= 1:
+        ws.clear()
+        ws.append_row(expected)
+        return pd.DataFrame(columns=expected)
+
+    # Si ya hay data, NO TOCAR. Leemos con el header que exista y mapeamos.
+    rows = values[1:]
+    df = pd.DataFrame(rows, columns=got)
+
+    # Asegura todas las columnas esperadas
+    for col in expected:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Ordena y devuelve en el orden esperado
+    return df[expected]
+
 
         rows = values[1:]
         df = pd.DataFrame(rows, columns=TABLE_COLUMNS[name])
