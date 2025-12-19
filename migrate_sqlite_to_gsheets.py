@@ -13,10 +13,9 @@ Usage (Mac/Linux):
     --spreadsheet_id "..." \
     --service_account_json "/path/to/service_account.json"
 
-This script:
-  - ensures worksheets exist: providers, offices, agents, products, coverage_alias, policies
-  - writes a header row EXACTLY as expected by the Streamlit app
-  - writes all rows (reordered to match the app schema)
+The script will:
+  - ensure worksheets exist: providers, offices, agents, products, coverage_alias, policies
+  - write headers and all rows (in the exact schema expected by the app)
 
 Note: share the Google Sheet with the service account email (Editor).
 """
@@ -31,6 +30,9 @@ from pathlib import Path
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import APIError
+
 
 TABLE_COLUMNS: dict[str, list[str]] = {
     "providers": ["id", "code", "name", "currency", "active"],
@@ -70,19 +72,34 @@ def read_sqlite_table(conn: sqlite3.Connection, name: str) -> pd.DataFrame:
 
 
 def normalize_df_to_schema(table: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Reorder columns to match TABLE_COLUMNS[table]. Add missing columns as blank.
-    Ignore extra columns from SQLite (keeps only the expected ones)."""
     expected = TABLE_COLUMNS[table]
     out = df.copy()
 
-    # Add missing columns
     for c in expected:
         if c not in out.columns:
             out[c] = pd.NA
 
-    # Keep only expected columns (drop extras)
     out = out[expected]
     return out
+
+
+def get_or_create_worksheet(sh: gspread.Spreadsheet, title: str, nrows: int, ncols: int):
+    """Only create when WorksheetNotFound. If API says 'already exists', fallback to open it."""
+    try:
+        return sh.worksheet(title)
+    except WorksheetNotFound:
+        # Only in this case we create it
+        try:
+            return sh.add_worksheet(title=title, rows=nrows, cols=ncols)
+        except APIError as e:
+            # If it says it already exists, just open it
+            msg = str(e)
+            if "already exists" in msg or "A sheet with the name" in msg:
+                return sh.worksheet(title)
+            raise
+    except Exception:
+        # Any other error is NOT "missing sheet": do not create
+        raise
 
 
 def main():
@@ -115,21 +132,16 @@ def main():
             df_raw = read_sqlite_table(conn, t)
             df = normalize_df_to_schema(t, df_raw)
 
-            # Ensure worksheet (NO falla si existe)
-            try:
-                ws = sh.worksheet(t)
-            except Exception:
-                ws = sh.add_worksheet(
-                    title=t,
-                    rows=max(2000, len(df) + 10),
-                    cols=max(10, len(df.columns) + 5),
-                )
+            ws = get_or_create_worksheet(
+                sh,
+                title=t,
+                nrows=max(2000, len(df) + 10),
+                ncols=max(10, len(df.columns) + 5),
+            )
 
-            # Build values: header + rows
             df2 = df.where(pd.notnull(df), "")
             values = [TABLE_COLUMNS[t]] + [list(r) for r in df2.itertuples(index=False)]
 
-            # Clear and write everything starting at A1
             ws.clear()
             ws.update(values)
 
