@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
+import time
 import pandas as pd
 
 from gspread.exceptions import WorksheetNotFound, APIError
@@ -82,6 +83,52 @@ def _coerce_types(table: str, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _to_cell(x: Any) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x)
+
+
+def _chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def _is_quota_429(err: Exception) -> bool:
+    s = str(err)
+    return ("[429]" in s) or ("Quota exceeded" in s) or ("Read requests" in s)
+
+
+def _with_retry(fn, *, max_tries: int = 6, base_sleep: float = 1.2):
+    """
+    Retry wrapper focused on Google Sheets quota spikes (429).
+    Exponential backoff: base_sleep * (2^(try-1)).
+    """
+    last = None
+    for i in range(1, max_tries + 1):
+        try:
+            return fn()
+        except APIError as e:
+            last = e
+            if not _is_quota_429(e) or i == max_tries:
+                raise
+            time.sleep(base_sleep * (2 ** (i - 1)))
+        except Exception as e:
+            # If it looks like quota, retry; else raise
+            last = e
+            if not _is_quota_429(e) or i == max_tries:
+                raise
+            time.sleep(base_sleep * (2 ** (i - 1)))
+    if last:
+        raise last
+    raise RuntimeError("Unexpected retry wrapper state")
+
+
 @dataclass
 class SheetConfig:
     spreadsheet_id: str
@@ -89,10 +136,18 @@ class SheetConfig:
 
 
 class SheetDB:
+    """
+    SAFE BY DEFAULT:
+    - NUNCA crea worksheets.
+    - Si una hoja no existe, levanta error claro.
+    - Para import masivo: append_rows_batch() (sin reescribir toda la hoja).
+    """
+
     def __init__(self, cfg: SheetConfig):
         self.cfg = cfg
         self._client = None
         self._ss = None
+        self._ws_cache: dict[str, Any] = {}
 
     @staticmethod
     def from_streamlit_secrets(secrets: dict) -> "SheetDB":
@@ -125,43 +180,53 @@ class SheetDB:
 
         self._connect()
 
-        # ✅ SOLO crear si de verdad no existe
+        if name in self._ws_cache:
+            return self._ws_cache[name]
+
         try:
-            return self._ss.worksheet(name)
-        except WorksheetNotFound:
-            try:
-                ws = self._ss.add_worksheet(title=name, rows=1000, cols=len(TABLE_COLUMNS[name]) + 5)
-                ws.update([TABLE_COLUMNS[name]])
-                return ws
-            except APIError as e:
-                msg = str(e)
-                # ✅ Si la API dice "ya existe", abrirla
-                if "already exists" in msg or "A sheet with the name" in msg:
-                    return self._ss.worksheet(name)
-                raise
-        except Exception:
-            # ✅ Cualquier otro error NO es "missing sheet"
-            raise
+            ws = _with_retry(lambda: self._ss.worksheet(name))
+        except WorksheetNotFound as e:
+            raise RuntimeError(
+                f"No existe la hoja (worksheet) '{name}' en Google Sheets. "
+                f"Créala manualmente con este header exacto: {TABLE_COLUMNS[name]}"
+            ) from e
+
+        self._ws_cache[name] = ws
+        return ws
+
+    # ----------------------------
+    # Headers / schema
+    # ----------------------------
+    def ensure_header(self, name: str) -> None:
+        ws = self._ws(name)
+        expected = TABLE_COLUMNS[name]
+        values = _with_retry(lambda: ws.get_all_values())
+        if not values:
+            _with_retry(lambda: ws.update([expected]))
+            return
+        header = [h.strip() for h in values[0]]
+        if header != expected and len(values) <= 1:
+            _with_retry(lambda: ws.clear())
+            _with_retry(lambda: ws.update([expected]))
+            return
 
     def read_table(self, name: str) -> pd.DataFrame:
+        self.ensure_header(name)
         ws = self._ws(name)
-        values = ws.get_all_values()
+        values = _with_retry(lambda: ws.get_all_values())
         expected = TABLE_COLUMNS[name]
 
         if not values:
-            ws.update([expected])
             return pd.DataFrame(columns=expected)
 
         header = values[0]
         got = [h.strip() for h in header]
 
         if got != expected:
-            if len(values) <= 1:
-                ws.clear()
-                ws.update([expected])
-                return pd.DataFrame(columns=expected)
-
+            # If header mismatched but there is data, align columns safely
             rows = values[1:]
+            if not rows:
+                return pd.DataFrame(columns=expected)
             df = pd.DataFrame(rows, columns=got)
             for col in expected:
                 if col not in df.columns:
@@ -176,9 +241,14 @@ class SheetDB:
         return df.reset_index(drop=True)
 
     def write_table(self, name: str, df: pd.DataFrame) -> None:
+        """
+        OJO: Esto reescribe toda la hoja (bien para pantallas CRUD pequeñas).
+        Para import masivo usa append_rows_batch().
+        """
         if name not in TABLE_COLUMNS:
             raise KeyError(f"Tabla desconocida: {name}")
 
+        self.ensure_header(name)
         ws = self._ws(name)
 
         out = df.copy()
@@ -187,27 +257,72 @@ class SheetDB:
                 out[c] = pd.NA
         out = out[TABLE_COLUMNS[name]]
 
-        existing = ws.get_all_values()
+        existing = _with_retry(lambda: ws.get_all_values())
         if out.empty and len(existing) > 1:
             return
 
-        def _to_cell(x: Any) -> str:
-            if x is None:
-                return ""
-            try:
-                if pd.isna(x):
-                    return ""
-            except Exception:
-                pass
-            return str(x)
-
         values = [TABLE_COLUMNS[name]] + [[_to_cell(v) for v in row] for row in out.itertuples(index=False)]
 
-        ws.clear()
-        ws.update(values)
+        _with_retry(lambda: ws.clear())
+        _with_retry(lambda: ws.update(values))
 
+    # ----------------------------
+    # Fast utilities for import
+    # ----------------------------
+    def get_header(self, name: str) -> list[str]:
+        self.ensure_header(name)
+        ws = self._ws(name)
+        row1 = _with_retry(lambda: ws.row_values(1))
+        return [h.strip() for h in row1]
+
+    def col_index(self, name: str, col_name: str) -> int:
+        header = self.get_header(name)
+        try:
+            return header.index(col_name) + 1  # 1-based
+        except ValueError:
+            raise RuntimeError(f"Columna '{col_name}' no existe en '{name}'. Header actual: {header}")
+
+    def get_col_values(self, name: str, col_name: str) -> list[str]:
+        ws = self._ws(name)
+        idx = self.col_index(name, col_name)
+        col = _with_retry(lambda: ws.col_values(idx))
+        # remove header
+        return col[1:] if len(col) > 1 else []
+
+    def max_int_in_col(self, name: str, col_name: str) -> int:
+        vals = self.get_col_values(name, col_name)
+        mx = 0
+        for v in vals:
+            try:
+                n = int(str(v).strip())
+                if n > mx:
+                    mx = n
+            except Exception:
+                continue
+        return mx
+
+    def append_rows_batch(self, name: str, rows: list[list[Any]], *, chunk_size: int = 250) -> None:
+        """
+        Appends rows to an existing worksheet in chunks.
+        - No full-table reads/writes.
+        - Ideal for PDF import.
+        """
+        if not rows:
+            return
+        self.ensure_header(name)
+        ws = self._ws(name)
+
+        def _append(chunk: list[list[Any]]):
+            # normalize to strings
+            chunk2 = [[_to_cell(x) for x in r] for r in chunk]
+            return ws.append_rows(chunk2, value_input_option="RAW")
+
+        for chunk in _chunked(rows, chunk_size):
+            _with_retry(lambda c=chunk: _append(c))
+
+    # ----------------------------
+    # ID helper (kept for small CRUD)
+    # ----------------------------
     def next_id(self, name: str) -> int:
-        df = self.read_table(name)
-        if df.empty or "id" not in df.columns or df["id"].dropna().empty:
-            return 1
-        return int(df["id"].dropna().astype(int).max()) + 1
+        mx = self.max_int_in_col(name, "id")
+        return mx + 1
