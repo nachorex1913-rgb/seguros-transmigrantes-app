@@ -1,0 +1,6 @@
+streamlit
+pandas
+pdfplumber
+# Google Sheets
+gspread
+google-auth
