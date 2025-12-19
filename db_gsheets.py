@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 import pandas as pd
 
@@ -92,10 +91,11 @@ class SheetConfig:
 class SheetDB:
     """Google Sheets-backed storage.
 
-    Expects a Spreadsheet with worksheets named exactly:
+    Expects worksheets named exactly:
     providers, offices, agents, products, coverage_alias, policies
 
-    Each worksheet must have a header row matching TABLE_COLUMNS.
+    Each worksheet should have a header row matching TABLE_COLUMNS.
+    If header differs, we DO NOT wipe data; we map columns safely.
     """
 
     def __init__(self, cfg: SheetConfig):
@@ -108,20 +108,21 @@ class SheetDB:
         """Build from st.secrets.
 
         Required:
-          - st.secrets["GSHEETS_SPREADSHEET_ID"]
-          - st.secrets["gcp_service_account"] (dict)
+          - secrets["GSHEETS_SPREADSHEET_ID"]
+          - secrets["gcp_service_account"] (dict)
         """
         sid = secrets.get("GSHEETS_SPREADSHEET_ID")
         sa = secrets.get("gcp_service_account")
         if not sid or not sa:
             raise RuntimeError(
-                "Faltan secretos. Agrega GSHEETS_SPREADSHEET_ID y gcp_service_account en .streamlit/secrets.toml"
+                "Faltan secretos. Agrega GSHEETS_SPREADSHEET_ID y gcp_service_account en secrets."
             )
         return SheetDB(SheetConfig(spreadsheet_id=sid, credentials_json=dict(sa)))
 
-    def _connect(self):
+    def _connect(self) -> None:
         if self._client is not None and self._ss is not None:
             return
+
         import gspread
         from google.oauth2.service_account import Credentials
 
@@ -139,75 +140,51 @@ class SheetDB:
             return self._ss.worksheet(name)
         except Exception:
             # Create worksheet if missing
-            ws = self._ss.add_worksheet(title=name, rows=1000, cols=len(TABLE_COLUMNS[name]) + 5)
+            if name not in TABLE_COLUMNS:
+                raise KeyError(f"Tabla desconocida: {name}")
+            ws = self._ss.add_worksheet(title=name, rows=2000, cols=max(10, len(TABLE_COLUMNS[name]) + 5))
             ws.append_row(TABLE_COLUMNS[name])
             return ws
 
     def read_table(self, name: str) -> pd.DataFrame:
-    ws = self.ws(name)
-    values = ws.get_all_values()
+        if name not in TABLE_COLUMNS:
+            raise KeyError(f"Tabla desconocida: {name}")
 
-    # Si la hoja está totalmente vacía
-    if not values:
-        ws.append_row(TABLE_COLUMNS[name])
-        return pd.DataFrame(columns=TABLE_COLUMNS[name])
+        ws = self._ws(name)
+        values = ws.get_all_values()
 
-    header = values[0]
-    expected = TABLE_COLUMNS[name]
-    got = [h.strip() for h in header]
+        # Sheet completamente vacío: crea header
+        if not values:
+            ws.append_row(TABLE_COLUMNS[name])
+            return pd.DataFrame(columns=TABLE_COLUMNS[name])
 
-    # Header distinto
-    if got != expected:
-        # Si solo hay header, se puede reconstruir
-        if len(values) <= 1:
-            ws.clear()
-            ws.append_row(expected)
-            return pd.DataFrame(columns=expected)
+        header = values[0]
+        expected = TABLE_COLUMNS[name]
+        got = [h.strip() for h in header]
 
-        # Si ya hay data, NO borrar: mapear columnas
-        rows = values[1:]
-        df = pd.DataFrame(rows, columns=got)
+        # Header distinto: NO borramos data si ya hay filas
+        if got != expected:
+            # Si solo hay header, podemos corregir (aquí sí es seguro)
+            if len(values) <= 1:
+                ws.clear()
+                ws.append_row(expected)
+                return pd.DataFrame(columns=expected)
 
-        for col in expected:
-            if col not in df.columns:
-                df[col] = ""
+            # Si hay data, mapeamos columnas sin borrar
+            rows = values[1:]
+            df = pd.DataFrame(rows, columns=got)
 
-        return df[expected]
+            # Asegura columnas esperadas
+            for col in expected:
+                if col not in df.columns:
+                    df[col] = ""
 
-    # Header correcto
-    rows = values[1:]
-    return pd.DataFrame(rows, columns=expected)
+            df = df[expected]
+        else:
+            rows = values[1:]
+            df = pd.DataFrame(rows, columns=expected)
 
-
-header = values[0]
-
-expected = TABLE_COLUMNS[name]
-got = [h.strip() for h in header]
-
-if got != expected:
-    # Si solo hay header, se puede reconstruir
-    if len(values) <= 1:
-        ws.clear()
-        ws.append_row(expected)
-        return pd.DataFrame(columns=expected)
-
-    # Si ya hay data, no borramos: mapeamos columnas
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=got)
-
-    for col in expected:
-        if col not in df.columns:
-            df[col] = ""
-
-    return df[expected]
-
-rows = values[1:]
-df = pd.DataFrame(rows, columns=expected)
-
-    
-        rows = values[1:]
-        df = pd.DataFrame(rows, columns=TABLE_COLUMNS[name])
-        # Convert empty strings to NA
+        # Limpieza + tipos
         df = df.replace({"": pd.NA})
         df = _coerce_types(name, df)
         return df
@@ -215,37 +192,41 @@ df = pd.DataFrame(rows, columns=expected)
     def write_table(self, name: str, df: pd.DataFrame) -> None:
         if name not in TABLE_COLUMNS:
             raise KeyError(f"Tabla desconocida: {name}")
+
         ws = self._ws(name)
 
         out = df.copy()
-        # Ensure columns
+
+        # Ensure all columns exist
         for c in TABLE_COLUMNS[name]:
             if c not in out.columns:
                 out[c] = pd.NA
         out = out[TABLE_COLUMNS[name]]
 
-        # Convert to strings for Sheets
+        # Si me intentan guardar vacío pero ya hay data, NO borro nada
+        existing = ws.get_all_values()
+        if out.empty and len(existing) > 1:
+            return
+
         def _to_cell(x: Any) -> str:
-            if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
+            if x is None:
                 return ""
+            try:
+                if pd.isna(x):
+                    return ""
+            except Exception:
+                pass
             return str(x)
 
         values = [TABLE_COLUMNS[name]]
         for row in out.itertuples(index=False):
             values.append([_to_cell(v) for v in row])
 
-existing = ws.get_all_values()
-
-# Si me intentan guardar vacío pero ya hay data, NO borro
-if out.empty and len(existing) > 1:
-    return
-
-ws.clear()
-ws.update(values)
-
+        ws.clear()
+        ws.update(values)
 
     def next_id(self, name: str) -> int:
         df = self.read_table(name)
-        if df.empty or df["id"].dropna().empty:
+        if df.empty or "id" not in df.columns or df["id"].dropna().empty:
             return 1
         return int(df["id"].dropna().astype(int).max()) + 1
