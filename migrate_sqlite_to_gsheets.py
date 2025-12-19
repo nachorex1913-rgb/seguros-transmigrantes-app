@@ -1,26 +1,15 @@
 """
 Migrate the original SQLite DB into Google Sheets.
 
-Usage (Windows):
-  py tools/migrate_sqlite_to_gsheets.py ^
-    --sqlite_path "C:\\ruta\\db.sqlite" ^
-    --spreadsheet_id "..." ^
-    --service_account_json "C:\\ruta\\service_account.json"
-
-Usage (Mac/Linux):
-  python tools/migrate_sqlite_to_gsheets.py \
-    --sqlite_path "/path/to/db.sqlite" \
-    --spreadsheet_id "..." \
-    --service_account_json "/path/to/service_account.json"
-
 The script will:
   - ensure worksheets exist: providers, offices, agents, products, coverage_alias, policies
   - write headers and all rows (in the exact schema expected by the app)
 
-Note: share the Google Sheet with the service account email (Editor).
+Rule:
+  - NEVER attempts to create a worksheet if it already exists.
 """
 
-from __future__ import annotations
+from _future_ import annotations
 
 import argparse
 import json
@@ -30,8 +19,7 @@ from pathlib import Path
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import WorksheetNotFound
-from gspread.exceptions import APIError
+from gspread.exceptions import WorksheetNotFound, APIError
 
 
 TABLE_COLUMNS: dict[str, list[str]] = {
@@ -84,21 +72,22 @@ def normalize_df_to_schema(table: str, df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_or_create_worksheet(sh: gspread.Spreadsheet, title: str, nrows: int, ncols: int):
-    """Only create when WorksheetNotFound. If API says 'already exists', fallback to open it."""
-    try:
+    """
+    Only creates when worksheet truly does not exist.
+    If API says 'already exists', fallback to open it.
+    """
+    # Fast check to avoid repeated calls
+    existing_titles = {ws.title for ws in sh.worksheets()}
+    if title in existing_titles:
         return sh.worksheet(title)
-    except WorksheetNotFound:
-        # Only in this case we create it
-        try:
-            return sh.add_worksheet(title=title, rows=nrows, cols=ncols)
-        except APIError as e:
-            # If it says it already exists, just open it
-            msg = str(e)
-            if "already exists" in msg or "A sheet with the name" in msg:
-                return sh.worksheet(title)
-            raise
-    except Exception:
-        # Any other error is NOT "missing sheet": do not create
+
+    # Missing -> create once
+    try:
+        return sh.add_worksheet(title=title, rows=nrows, cols=ncols)
+    except APIError as e:
+        msg = str(e)
+        if "already exists" in msg or "A sheet with the name" in msg:
+            return sh.worksheet(title)
         raise
 
 
@@ -150,5 +139,5 @@ def main():
     print("\nListo. Abre tu Google Sheet y verifica las pestañas.")
 
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
