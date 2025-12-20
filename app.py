@@ -15,7 +15,7 @@ import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = ROOT_DIR / "assets"
-LOGO_PATH = ASSETS_DIR / "logo_v2.png"
+LOGO_PATH = ASSETS_DIR / "logo.png"
 
 st.set_page_config(
     page_title="Seguros Transmigrantes",
