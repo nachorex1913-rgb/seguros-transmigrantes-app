@@ -10,6 +10,19 @@ import pdfplumber
 # ✅ IMPORTANTE: importamos también TABLE_COLUMNS (lo usas en Importar PDF)
 from db_gsheets import SheetDB, TABLE_COLUMNS
 
+from pathlib import Path
+import streamlit as st
+
+ROOT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = ROOT_DIR / "assets"
+LOGO_PATH = ASSETS_DIR / "logo.png"
+
+st.set_page_config(
+    page_title="Seguros Transmigrantes",
+    page_icon=str(LOGO_PATH),
+    layout="wide",
+)
+
 # ======================
 # CONFIGURACIÓN LOGIN PIN
 # ======================
