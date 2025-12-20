@@ -33,7 +33,6 @@ if "authenticated" not in st.session_state:
 
 
 def pin_login():
-    st.set_page_config(page_title="Seguros Transmigrantes", layout="wide")
     st.markdown("## 🔐 Acceso protegido")
     st.markdown("Ingresa tu PIN para continuar")
     pin_input = st.text_input("PIN", type="password", placeholder="••••", max_chars=6)
@@ -65,7 +64,6 @@ ROOT_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = ROOT_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "logo.png"
 
-st.set_page_config(page_title="Seguros Transmigrantes", page_icon="🛡️", layout="wide")
 
 # =============================
 # DB (Google Sheets)
